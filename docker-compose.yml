@@ -1,0 +1,78 @@
+# Local, production-like run of all three tiers:
+#   web (Nginx + React)  ->  api (Express)  ->  db (PostgreSQL)
+# Usage:
+#   cp .env.example .env   (fill in the values)
+#   docker compose up --build        -> http://localhost:8080
+#   docker compose --profile dev up  -> also starts Adminer on http://localhost:8081
+#   docker compose run --rm api node src/seed.js   -> demo data
+
+name: campusshelf
+
+x-api-env: &api-env
+  NODE_ENV: production
+  PORT: "3000"
+  DB_HOST: db
+  DB_PORT: "5432"
+  DB_NAME: campusshelf
+  DB_USER: campusshelf
+  DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+  DB_SSL: "false"
+  JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+  SEED_DEMO_PASSWORD: ${SEED_DEMO_PASSWORD:-}
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: campusshelf
+      POSTGRES_USER: campusshelf
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U campusshelf -d campusshelf"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # No "ports": the database is reachable only on the internal network (like the private DB subnet)
+
+  migrate:
+    build: ./api
+    image: campusshelf-api:local
+    command: ["node", "src/migrate.js"]
+    environment: *api-env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    image: campusshelf-api:local
+    environment: *api-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # No "ports": the API is reachable only from the web container (like the private app tier)
+
+  web:
+    build:
+      context: ./web
+      args:
+        VITE_API_BASE_URL: /api
+    image: campusshelf-web:local
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  adminer:
+    image: adminer:4
+    profiles: ["dev"]
+    ports:
+      - "8081:8080"
+    depends_on:
+      - db
+
+volumes:
+  pgdata:

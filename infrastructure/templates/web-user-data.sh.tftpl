@@ -1,0 +1,81 @@
+#!/bin/bash
+# Web tier bootstrap (Amazon Linux 2023). Rendered by Terraform templatefile():
+# $${name} placeholders are filled by Terraform; plain $NAME variables are shell variables.
+set -euxo pipefail
+
+REGION="${region}"
+REGISTRY="${ecr_registry}"
+PARAMS="${param_prefix}"
+APP_ASG="${app_asg_name}"
+
+retry() { for i in $(seq 1 30); do "$@" && return 0; echo "retry $i: $*" >&2; sleep 10; done; return 1; }
+
+retry dnf install -y docker
+systemctl enable --now docker
+
+TAG=$(retry aws ssm get-parameter --region "$REGION" --name "$PARAMS/image_tag" --query Parameter.Value --output text)
+IMAGE="$REGISTRY/${repo}:$TAG"
+install -d -m 755 /opt/campusshelf/upstream
+
+# ---- Free service discovery ----
+# Every 20 s: list the running app-tier instances (tag added automatically by the ASG),
+# write them into the Nginx upstream file and reload Nginx if the list changed.
+# Replaces a paid internal load balancer / Cloud Map / Route 53 private zone.
+cat > /usr/local/bin/discover-app.sh <<'EOS'
+#!/bin/bash
+set -euo pipefail
+REGION="$1"
+ASG="$2"
+OUT=/opt/campusshelf/upstream/app-upstream.inc
+IPS=$(aws ec2 describe-instances --region "$REGION" \
+  --filters "Name=tag:aws:autoscaling:groupName,Values=$ASG" "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].PrivateIpAddress' --output text)
+TMP=$(mktemp)
+if [ -z "$IPS" ]; then
+  echo "server 127.0.0.1:65535;  # no app instances running: Nginx answers 502" > "$TMP"
+else
+  for ip in $IPS; do echo "server $ip:3000 max_fails=1 fail_timeout=15s;"; done | sort > "$TMP"
+fi
+if ! cmp -s "$TMP" "$OUT"; then
+  mv "$TMP" "$OUT"
+  chmod 644 "$OUT"
+  echo "app upstream changed: $(tr '\n' ' ' < "$OUT")"
+  docker exec web nginx -s reload 2>/dev/null || true
+else
+  rm -f "$TMP"
+fi
+EOS
+chmod 755 /usr/local/bin/discover-app.sh
+retry /usr/local/bin/discover-app.sh "$REGION" "$APP_ASG"
+
+cat > /etc/systemd/system/discover-app.service <<EOF
+[Unit]
+Description=Refresh the Nginx upstream list of app-tier instances
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/discover-app.sh $REGION $APP_ASG
+EOF
+cat > /etc/systemd/system/discover-app.timer <<EOF
+[Unit]
+Description=Run app-tier discovery every 20 seconds
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=20
+AccuracySec=1
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now discover-app.timer
+
+retry sh -c "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $REGISTRY"
+retry docker pull "$IMAGE"
+
+docker run -d --name web --restart unless-stopped -p 80:80 \
+  -v /opt/campusshelf/upstream:/etc/nginx/upstream:ro \
+  --log-driver awslogs --log-opt awslogs-region="$REGION" \
+  --log-opt awslogs-group="${log_group}" --log-opt mode=non-blocking \
+  "$IMAGE"
+
+retry curl -fsS http://127.0.0.1/healthz
+echo "web ready ($TAG)"

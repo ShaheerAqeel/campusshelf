@@ -1,0 +1,29 @@
+# Secrets and local config
+.env
+*.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Node
+node_modules/
+dist/
+coverage/
+npm-debug.log*
+
+# Tests
+playwright-report/
+test-results/
+
+# Terraform: state contains secrets, never commit it
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+crash.log
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

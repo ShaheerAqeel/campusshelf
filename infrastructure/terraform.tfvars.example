@@ -1,0 +1,19 @@
+# Copy to terraform.tfvars (git-ignored) and fill in.
+region        = "ap-southeast-2" # your project home region (settings.aws.com -> project -> Additional info)
+instance_type = "t3.micro" # Free account plan; "t2.micro" on a legacy Free Tier account
+alert_email   = "you@example.com"
+github_repo   = "your-github-user/campusshelf"
+
+# Session switch (see README): scripts/session-up.sh and session-down.sh set these for you
+session_active = true
+enable_alb     = false
+
+budget_limit_usd = "1"
+
+# CI/CD login. New-style "project" accounts cannot create OIDC providers -> keep false
+# (a least-privilege IAM user + GitHub Secrets is used instead).
+use_github_oidc             = false
+create_github_oidc_provider = true
+
+# Free plan allows at most 1 day of RDS backups
+db_backup_retention_days = 1

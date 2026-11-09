@@ -1,0 +1,221 @@
+name: CI/CD
+
+# Pull requests: test both tiers and build both images (no push).
+# Push to main: test, then build + push SHA-tagged images to ECR, roll out via ASG
+# instance refresh, verify, and roll back automatically on failure.
+# Manual run with image_tag: redeploy an existing image (manual rollback, no rebuild).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Existing image tag (a commit SHA) to redeploy. Leave empty to build the current commit."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  test-api:
+    name: API tests (Jest + PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: campusshelf_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    defaults:
+      run:
+        working-directory: api
+    env:
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      DB_NAME: campusshelf_test
+      DB_USER: test
+      DB_PASSWORD: test
+      DB_SSL: "false"
+      JWT_SECRET: ci-only-value-not-a-real-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - name: Migrations on an empty database
+        run: node src/migrate.js
+      - name: Tests with coverage
+        run: npm test -- --coverage
+
+  test-web:
+    name: Web tests (Vitest) and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test -- --run
+      - run: npm run build
+        env:
+          VITE_API_BASE_URL: /api
+      - name: Bundle must not point at a development API
+        run: "! grep -r 'localhost:3000' dist"
+
+  build-images:
+    name: Docker builds (pull requests)
+    if: github.event_name == 'pull_request'
+    needs: [test-api, test-web]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t campusshelf-api:pr api
+      - run: docker build -t campusshelf-web:pr --build-arg VITE_API_BASE_URL=/api web
+      - name: Image sizes (ECR free storage is 500 MB)
+        run: docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep campusshelf >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Build, push and deploy
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: [test-api, test-web]
+    runs-on: ubuntu-latest
+    environment: production # required reviewer + main-only rule; also the OIDC trust subject
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # used only when the OIDC role is configured
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      INPUT_TAG: ${{ inputs.image_tag }}
+      APP_URL: ${{ vars.APP_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Preferred: short-lived credentials through OIDC (set variable AWS_DEPLOY_ROLE_ARN).
+      - name: AWS credentials (OIDC role)
+        if: vars.AWS_DEPLOY_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Fallback for accounts that cannot create an OIDC provider (new-style AWS projects):
+      # a dedicated least-privilege IAM user whose key lives in encrypted GitHub Secrets.
+      - name: AWS credentials (deploy user)
+        if: vars.AWS_DEPLOY_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Choose the image tag
+        id: tag
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            if ! [[ "$INPUT_TAG" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then echo "Invalid tag"; exit 1; fi
+            echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push images (tagged with the commit SHA)
+        if: steps.tag.outputs.build == 'true'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          docker build -t "$REGISTRY/campusshelf-api:$TAG" --build-arg APP_VERSION="$TAG" api
+          docker build -t "$REGISTRY/campusshelf-web:$TAG" --build-arg VITE_API_BASE_URL=/api web
+          docker push "$REGISTRY/campusshelf-api:$TAG"
+          docker push "$REGISTRY/campusshelf-web:$TAG"
+
+      - name: Check the requested image exists (manual redeploy)
+        if: steps.tag.outputs.build == 'false'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          aws ecr describe-images --repository-name campusshelf-api --image-ids imageTag="$TAG" >/dev/null
+          aws ecr describe-images --repository-name campusshelf-web --image-ids imageTag="$TAG" >/dev/null
+
+      - name: Record the previous tag and publish the new one
+        id: release
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          PREV=$(aws ssm get-parameter --name /campusshelf/image_tag --query Parameter.Value --output text)
+          echo "prev=$PREV" >> "$GITHUB_OUTPUT"
+          aws ssm put-parameter --name /campusshelf/image_tag --value "$TAG" --overwrite >/dev/null
+          DESIRED=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names campusshelf-app \
+            --query 'AutoScalingGroups[0].DesiredCapacity' --output text)
+          if [ "$DESIRED" -gt 0 ]; then echo "active=true" >> "$GITHUB_OUTPUT"; else echo "active=false" >> "$GITHUB_OUTPUT"; fi
+          echo "Previous tag: $PREV, new tag: $TAG, app desired capacity: $DESIRED"
+
+      - name: Roll out (app tier first, then web tier)
+        if: steps.release.outputs.active == 'true'
+        run: |
+          chmod +x scripts/wait-instance-refresh.sh
+          scripts/wait-instance-refresh.sh campusshelf-app
+          scripts/wait-instance-refresh.sh campusshelf-web
+
+      - name: Post-deploy health check
+        if: steps.release.outputs.active == 'true' && env.APP_URL != ''
+        run: |
+          curl --fail --silent --show-error --retry 12 --retry-delay 10 --retry-all-errors "$APP_URL/api/health/db"
+          echo
+          curl --fail --silent --show-error "$APP_URL/api/" ; echo
+
+      - name: Stack asleep, nothing rolled out
+        if: steps.release.outputs.active == 'false'
+        run: echo "::notice::Images pushed and tag published. The stack is asleep; the next session-up boots this version."
+
+      - name: Roll back to the previous tag
+        if: failure() && steps.release.outputs.prev != '' && steps.release.outputs.prev != steps.tag.outputs.tag
+        env:
+          PREV: ${{ steps.release.outputs.prev }}
+        run: |
+          echo "::warning::Deployment failed, rolling back to $PREV"
+          aws ssm put-parameter --name /campusshelf/image_tag --value "$PREV" --overwrite >/dev/null
+          chmod +x scripts/wait-instance-refresh.sh
+          aws autoscaling cancel-instance-refresh --auto-scaling-group-name campusshelf-app 2>/dev/null || true
+          aws autoscaling cancel-instance-refresh --auto-scaling-group-name campusshelf-web 2>/dev/null || true
+          sleep 30
+          scripts/wait-instance-refresh.sh campusshelf-app || true
+          scripts/wait-instance-refresh.sh campusshelf-web || true
+          echo "### Rolled back to \`$PREV\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          {
+            echo "### Deployed \`${{ steps.tag.outputs.tag }}\`"
+            echo "- Previous tag: \`${{ steps.release.outputs.prev }}\`"
+            echo "- Rolled out to running instances: ${{ steps.release.outputs.active }}"
+            echo "- URL: ${APP_URL:-ALB disabled}"
+          } >> "$GITHUB_STEP_SUMMARY"

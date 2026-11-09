@@ -1,0 +1,70 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-paper: #f6f1e7;
+  --color-card: #fffdf8;
+  --color-ink: #1d2521;
+  --color-muted: #5f6b64;
+  --color-line: #e4dccb;
+  --color-forest: #1f4d3a;
+  --color-forest-dark: #163829;
+  --color-amber: #e9b44c;
+  --color-brick: #b4442f;
+  --font-serif: 'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+@layer base {
+  body {
+    @apply bg-paper text-ink font-sans antialiased;
+  }
+  h1,
+  h2,
+  h3 {
+    @apply font-serif tracking-tight;
+  }
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-forest;
+  }
+}
+
+/* Reusable UI classes. Tailwind v4 needs @utility for classes that other classes @apply. */
+@utility btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+@utility btn-primary {
+    @apply btn bg-forest text-paper hover:bg-forest-dark;
+  }
+
+@utility btn-secondary {
+    @apply btn border border-line bg-card text-ink hover:bg-paper;
+  }
+
+@utility btn-danger {
+    @apply btn border border-brick/30 bg-card text-brick hover:bg-brick/5;
+  }
+
+@utility input {
+    @apply w-full rounded-lg border border-line bg-card px-3 py-2 text-sm placeholder:text-muted/70 focus:border-forest focus:outline-none;
+  }
+
+@utility label {
+    @apply mb-1 block text-sm font-medium;
+  }
+
+@utility card {
+    @apply rounded-xl border border-line bg-card;
+  }
+
+@utility badge {
+    @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium;
+  }
+
+@utility table-head {
+    @apply border-b border-line px-4 py-3 text-left text-xs font-semibold tracking-wide text-muted uppercase;
+  }
+
+@utility table-cell {
+    @apply border-b border-line/60 px-4 py-3 text-sm;
+  }

@@ -1,0 +1,66 @@
+#!/bin/bash
+# Application tier bootstrap (Amazon Linux 2023). Rendered by Terraform templatefile():
+# $${name} placeholders are filled by Terraform; plain $NAME variables are shell variables.
+# No "set -x": tracing would copy secret-handling commands into the instance console log.
+set -euo pipefail
+
+REGION="${region}"
+REGISTRY="${ecr_registry}"
+PARAMS="${param_prefix}"
+
+retry() { for i in $(seq 1 30); do "$@" && return 0; echo "retry $i: $*" >&2; sleep 10; done; return 1; }
+
+# The NAT instance may still be booting on the very first apply
+retry dnf install -y docker
+systemctl enable --now docker
+
+param()  { aws ssm get-parameter --region "$REGION" --name "$1" --query Parameter.Value --output text; }
+secret() { aws ssm get-parameter --region "$REGION" --name "$1" --with-decryption --query Parameter.Value --output text; }
+
+TAG=$(retry param "$PARAMS/image_tag")
+IMAGE="$REGISTRY/${repo}:$TAG"
+
+# Secrets live only in tmpfs (/run), root-only. They are never in user data, the image or git.
+install -d -m 700 /run/campusshelf
+umask 077
+cat > /run/campusshelf/api.env <<EOF
+NODE_ENV=production
+PORT=3000
+APP_VERSION=$TAG
+DB_HOST=${db_host}
+DB_PORT=5432
+DB_NAME=${db_name}
+DB_USER=${db_user}
+DB_PASSWORD=$(secret "$PARAMS/db_password")
+DB_SSL=true
+JWT_SECRET=$(secret "$PARAMS/jwt_secret")
+EOF
+umask 022
+
+retry sh -c "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $REGISTRY"
+retry docker pull "$IMAGE"
+
+LOGOPTS=(--log-driver awslogs --log-opt awslogs-region="$REGION" --log-opt awslogs-group="${log_group}" --log-opt mode=non-blocking)
+
+# Migrations run on every boot: already-applied ones are skipped, and an advisory lock
+# stops two instances from migrating at the same time.
+docker run --rm --env-file /run/campusshelf/api.env "$${LOGOPTS[@]}" "$IMAGE" node src/migrate.js
+
+docker run -d --name api --restart unless-stopped -p 3000:3000 \
+  --env-file /run/campusshelf/api.env "$${LOGOPTS[@]}" "$IMAGE"
+
+# Readiness gate: if the API cannot reach the database within ~150 s, ask the ASG to
+# replace this instance. A failed deployment therefore fails the instance refresh,
+# which triggers the automatic rollback in CI/CD.
+for i in $(seq 1 30); do
+  if curl -fsS http://127.0.0.1:3000/health/db; then
+    echo "api ready ($TAG)"
+    exit 0
+  fi
+  sleep 5
+done
+
+INSTANCE_ID=$(ec2-metadata --instance-id | cut -d' ' -f2)
+echo "api not ready after 150s, marking $INSTANCE_ID unhealthy" >&2
+aws autoscaling set-instance-health --region "$REGION" --instance-id "$INSTANCE_ID" --health-status Unhealthy
+exit 1

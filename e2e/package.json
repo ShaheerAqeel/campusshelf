@@ -1,0 +1,17 @@
+{
+  "name": "campusshelf-e2e",
+  "version": "1.0.0",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "playwright test",
+    "report": "playwright show-report"
+  },
+  "license": "ISC",
+  "devDependencies": {
+    "@playwright/test": "^1.65.0"
+  },
+  "private": true,
+  "type": "module"
+}
