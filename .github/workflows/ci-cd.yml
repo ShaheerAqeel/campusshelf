@@ -151,10 +151,17 @@ jobs:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          docker build -t "$REGISTRY/campusshelf-api:$TAG" --build-arg APP_VERSION="$TAG" api
-          docker build -t "$REGISTRY/campusshelf-web:$TAG" --build-arg VITE_API_BASE_URL=/api web
-          docker push "$REGISTRY/campusshelf-api:$TAG"
-          docker push "$REGISTRY/campusshelf-web:$TAG"
+          # ECR tags are immutable, so skip an image that a previous attempt already pushed
+          # (this makes "Re-run jobs" safe).
+          for svc in api web; do
+            if aws ecr describe-images --repository-name "campusshelf-$svc" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+              echo "campusshelf-$svc:$TAG already in ECR, skipping build"
+              continue
+            fi
+            if [ "$svc" = api ]; then ARGS=(--build-arg APP_VERSION="$TAG"); else ARGS=(--build-arg VITE_API_BASE_URL=/api); fi
+            docker build -t "$REGISTRY/campusshelf-$svc:$TAG" "${ARGS[@]}" "$svc"
+            docker push "$REGISTRY/campusshelf-$svc:$TAG"
+          done
 
       - name: Check the requested image exists (manual redeploy)
         if: steps.tag.outputs.build == 'false'
