@@ -80,7 +80,7 @@ export default function Layout() {
       </main>
 
       <footer className="border-t border-line py-6 text-center text-xs text-muted">
-        CampusShelf v1.1 · SE-490 Cloud Computing CEA · Three-tier app on AWS
+        CampusShelf v1.3 · SE-490 Cloud Computing CEA · Three-tier app on AWS
       </footer>
     </div>
   );
